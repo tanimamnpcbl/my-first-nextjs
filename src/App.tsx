@@ -1,0 +1,1590 @@
+import React, { useState, useEffect } from "react";
+import { auth, db, handleFirestoreError, OperationType } from "./firebase";
+import { onAuthStateChanged, User, signOut } from "firebase/auth";
+import { collection, getDocs, getDoc, setDoc, doc, query, where } from "firebase/firestore";
+import { Exam, Attempt } from "./types";
+import { getViewFromPath, navigateToSlug, ViewType } from "./services/routerService";
+
+// Components
+import Navbar from "./components/Navbar";
+import AuthModal from "./components/AuthModal";
+import ExamCard from "./components/ExamCard";
+import ActiveExam from "./components/ActiveExam";
+import Leaderboard from "./components/Leaderboard";
+import Results from "./components/Results";
+import UserPerformanceChart from "./components/UserPerformanceChart";
+import AdCarousel from "./components/AdCarousel";
+import AdminLogin from "./components/AdminLogin";
+import AdminSettings from "./components/AdminSettings";
+import UserManagement from "./components/UserManagement";
+import AdManagement from "./components/AdManagement";
+import Pricing from "./components/Pricing";
+import PaymentModal from "./components/PaymentModal";
+import PendingPayments from "./components/PendingPayments";
+import AdminExamsSettings from "./components/AdminExamsSettings";
+import AdminPackagesSettings from "./components/AdminPackagesSettings";
+import AdminNotices from "./components/AdminNotices";
+import MyResults from "./components/MyResults";
+import MySubscriptions from "./components/MySubscriptions";
+import AdminBlogManager from "./components/AdminBlogManager";
+import BlogUser from "./components/BlogUser";
+import Helpline from "./components/Helpline";
+
+// Analytics
+import { trackEvent, initGA } from "./lib/analytics";
+
+// Icons
+import { 
+  Sparkles, 
+  HelpCircle, 
+  Database, 
+  AlertCircle, 
+  BookOpen, 
+  Plus, 
+  Layers, 
+  Award,
+  RefreshCw,
+  Calendar,
+  Archive,
+  Clock,
+  ChevronRight,
+  Lock,
+  Facebook,
+  Users,
+  Mail
+} from "lucide-react";
+import { motion, AnimatePresence } from "motion/react";
+
+// Robust helper to parse dates in mm/dd/yy or mm/dd/yyyy format for sorting
+const parseExamDate = (dateStr?: string): number => {
+  if (!dateStr) return Infinity; // No date means scheduled last
+  const parts = dateStr.split("/");
+  if (parts.length === 3) {
+    let month = parseInt(parts[0], 10);
+    let day = parseInt(parts[1], 10);
+    let year = parseInt(parts[2], 10);
+    if (year < 100) {
+      year += 2000; // Assume 21st century for 2-digit years
+    }
+    const d = new Date(year, month - 1, day);
+    if (!isNaN(d.getTime())) {
+      return d.getTime();
+    }
+  }
+  const parsed = Date.parse(dateStr);
+  return isNaN(parsed) ? Infinity : parsed;
+};
+
+// Robust helper to extract day of the week (Bengali & English) and format the date
+const getBanglaDayAndDate = (dateStr?: string): { dayName: string; formattedDate: string } => {
+  if (!dateStr) return { dayName: "নির্ধারিত নয়", formattedDate: "" };
+  
+  const banglaDays = [
+    "রবিবার (Sunday)",
+    "সোমবার (Monday)",
+    "মঙ্গলবার (Tuesday)",
+    "বুধবার (Wednesday)",
+    "বৃহস্পতিবার (Thursday)",
+    "শুক্রবার (Friday)",
+    "শনিবার (Saturday)"
+  ];
+  
+  try {
+    let dateObj: Date;
+    const parts = dateStr.split("/");
+    if (parts.length === 3) {
+      let month = parseInt(parts[0], 10);
+      let day = parseInt(parts[1], 10);
+      let year = parseInt(parts[2], 10);
+      if (year < 100) {
+        year += 2000;
+      }
+      dateObj = new Date(year, month - 1, day);
+    } else {
+      dateObj = new Date(dateStr);
+    }
+
+    if (isNaN(dateObj.getTime())) {
+      return { dayName: "অন্যান্য দিন", formattedDate: dateStr };
+    }
+
+    const dayName = banglaDays[dateObj.getDay()];
+    const day = String(dateObj.getDate()).padStart(2, "0");
+    const month = String(dateObj.getMonth() + 1).padStart(2, "0");
+    const year = dateObj.getFullYear();
+    const formattedDate = `${day}/${month}/${year}`;
+    
+    return { dayName, formattedDate };
+  } catch (e) {
+    return { dayName: "অন্যান্য দিন", formattedDate: dateStr };
+  }
+};
+
+export default function App() {
+  const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const [currentView, setCurrentView] = useState<ViewType>(() => getViewFromPath());
+  const [isAdminLoggedIn, setIsAdminLoggedIn] = useState(false);
+  const [activeAdminTab, setActiveAdminTab] = useState<"users" | "ads" | "exams" | "exam_configs" | "packages" | "payments" | "notices" | "blogs">("users");
+  const [isAuthOpen, setIsAuthOpen] = useState(false);
+  
+  // Theme settings
+  const [theme, setTheme] = useState<"light" | "dark" | string>(() => {
+    try {
+      const saved = localStorage.getItem("theme");
+      if (saved === "dark" || saved === "light") return saved;
+    } catch (e) {}
+    return "light";
+  });
+
+  const toggleTheme = () => {
+    setTheme((prev) => (prev === "light" ? "dark" : "light"));
+  };
+
+  // User Premium and Subscriptions state
+  const [userPremiumUntil, setUserPremiumUntil] = useState<string | null>(null);
+  const [userSubscriptions, setUserSubscriptions] = useState<{ [examId: string]: boolean }>({});
+  const [loadingSubscriptions, setLoadingSubscriptions] = useState(false);
+
+  // Locked exam unlock/purchase state
+  const [selectedUnlockExam, setSelectedUnlockExam] = useState<Exam | null>(null);
+  const [isUnlockModalOpen, setIsUnlockModalOpen] = useState(false);
+
+  // Guest start exam state
+  const [guestExamToStart, setGuestExamToStart] = useState<Exam | null>(null);
+  const [guestName, setGuestName] = useState("");
+  const [guestError, setGuestError] = useState("");
+
+  // App settings & Exams state
+  const [googleAppsScriptUrl, setGoogleAppsScriptUrl] = useState(() => {
+    try {
+      return localStorage.getItem("googleAppsScriptUrl") || "";
+    } catch (e) {
+      return "";
+    }
+  });
+  const [exams, setExams] = useState<Exam[]>([]);
+  const [loadingExams, setLoadingExams] = useState(true);
+  
+  // Tab-switching state for live, routine, and archive exams
+  const [activeExamTab, setActiveExamTab] = useState<"live" | "routine" | "archive">("live");
+  
+  // Attempted exams tracking (to allow only 1 attempt per exam)
+  const [attemptedExamIds, setAttemptedExamIds] = useState<string[]>([]);
+  const [userAttempts, setUserAttempts] = useState<Attempt[]>([]);
+  
+  // Active Exam state
+  const [activeExam, setActiveExam] = useState<Exam | null>(null);
+  const [activeCandidateName, setActiveCandidateName] = useState("");
+  const [activeExamMode, setActiveExamMode] = useState<"take" | "retake" | "view_questions" | "view_result">("take");
+
+  // Helper to load attempted exam IDs for current user or guest
+  const fetchUserAttempts = async (user: User | null) => {
+    const localAttempted = new Set<string>();
+    const fetchedAttemptsList: Attempt[] = [];
+    
+    // 1. Read from localStorage (robust for guest sessions)
+    try {
+      const localAttemptsStr = localStorage.getItem("localAttemptedExams") || "[]";
+      const parsed = JSON.parse(localAttemptsStr);
+      if (Array.isArray(parsed)) {
+        parsed.forEach(id => localAttempted.add(id));
+      }
+    } catch (e) {
+      console.error("Error reading local attempts:");
+    }
+
+    // 2. Read from Firestore attempts collection if authenticated
+    if (user) {
+      try {
+        const q = query(collection(db, "attempts"), where("userId", "==", user.uid));
+        const snap = await getDocs(q).catch((getErr) => {
+          handleFirestoreError(getErr, OperationType.LIST, "attempts");
+          throw getErr;
+        });
+        snap.forEach((docSnap) => {
+          const data = docSnap.data() as Attempt;
+          if (data.examId) {
+            localAttempted.add(data.examId);
+            fetchedAttemptsList.push(data);
+          }
+        });
+      } catch (err) {
+        console.error("Error fetching user attempts from Firestore:");
+      }
+    }
+
+    // Sort chronologically by completion date
+    fetchedAttemptsList.sort((a, b) => new Date(a.completedAt).getTime() - new Date(b.completedAt).getTime());
+
+    setAttemptedExamIds(Array.from(localAttempted));
+    setUserAttempts(fetchedAttemptsList);
+  };
+
+  // Helper to load premium membership and individual exam subscriptions
+  const fetchUserPremiumAndSubscriptions = async (user: User) => {
+    setLoadingSubscriptions(true);
+    try {
+      // 1. Fetch user document for premium date
+      const userRef = doc(db, "users", user.uid);
+      const userSnap = await getDoc(userRef).catch((getErr) => {
+        handleFirestoreError(getErr, OperationType.GET, `users/${user.uid}`);
+        throw getErr;
+      });
+      if (userSnap.exists()) {
+        const userData = userSnap.data();
+        if (userData.premiumUntil) {
+          setUserPremiumUntil(userData.premiumUntil);
+        } else {
+          setUserPremiumUntil(null);
+        }
+      } else {
+        setUserPremiumUntil(null);
+      }
+
+      // 2. Fetch individual single-exam purchases
+      const subsRef = collection(db, "users", user.uid, "subscriptions");
+      const subsSnap = await getDocs(subsRef).catch((getErr) => {
+        handleFirestoreError(getErr, OperationType.LIST, `users/${user.uid}/subscriptions`);
+        throw getErr;
+      });
+      const activeSubs: { [examId: string]: boolean } = {};
+      subsSnap.forEach((docSnap) => {
+        const data = docSnap.data();
+        if (data.isVerified === true || data.status === "verified") {
+          activeSubs[docSnap.id] = true;
+        }
+      });
+      setUserSubscriptions(activeSubs);
+    } catch (err) {
+      console.error("Error loading user subscriptions/premium:");
+    } finally {
+      setLoadingSubscriptions(false);
+    }
+  };
+
+  // Helper to verify if an exam is currently locked for the active user
+  const isExamLockedForUser = (exam: Exam): boolean => {
+    if (exam.isFree !== false) {
+      return false; // Free exams are never locked
+    }
+    if (!currentUser) {
+      return true; // Unauthenticated users cannot view paid exams
+    }
+    if (userPremiumUntil) {
+      const expiry = new Date(userPremiumUntil).getTime();
+      if (expiry > Date.now()) {
+        return false; // Active monthly/yearly premium unlocks everything
+      }
+    }
+    if (userSubscriptions[exam.id] === true) {
+      return false; // Individual manual exam purchase verified
+    }
+    return true;
+  };
+
+  // Theme synchronization effect
+  useEffect(() => {
+    try {
+      if (theme === "dark") {
+        document.documentElement.classList.add("dark");
+      } else {
+        document.documentElement.classList.remove("dark");
+      }
+      localStorage.setItem("theme", theme);
+    } catch (e) {}
+  }, [theme]);
+
+  // 1. Firebase auth listener
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, (user) => {
+      setCurrentUser((prevUser) => {
+        if (prevUser && !user) {
+          // This is a logout transition!
+          setCurrentView("home");
+          setIsAdminLoggedIn(false);
+        }
+        return user;
+      });
+      if (!user) {
+        try {
+          localStorage.removeItem("localAttemptedExams");
+        } catch (e) {
+          console.error("Error clearing local attempts:");
+        }
+        setAttemptedExamIds([]);
+        setUserAttempts([]);
+        setUserPremiumUntil(null);
+        setUserSubscriptions({});
+        setIsAdminLoggedIn(false);
+      } else {
+        fetchUserAttempts(user);
+        fetchUserPremiumAndSubscriptions(user);
+        // Admin status is determined solely by AdminLogin.tsx (Firestore admin collection check)
+      }
+    });
+    return unsubscribe;
+  }, []);
+
+  // 2. Load Google Apps Script URL settings & GA4 settings from Firestore and LocalStorage
+  const loadSettings = async (): Promise<string> => {
+    try {
+      // 1. Check local storage first for quick boot
+      const savedUrl = localStorage.getItem("googleAppsScriptUrl") || "";
+      setGoogleAppsScriptUrl(savedUrl);
+
+      const savedGaId = localStorage.getItem("gaMeasurementId") || "";
+      if (savedGaId) {
+        initGA(savedGaId);
+      }
+
+      // 2. Load fresh from Firestore settings/general
+      const docRef = doc(db, "settings", "general");
+      const docSnap = await getDoc(docRef);
+      if (docSnap.exists()) {
+        const data = docSnap.data();
+        if (data.googleAppsScriptUrl) {
+          localStorage.setItem("googleAppsScriptUrl", data.googleAppsScriptUrl);
+          setGoogleAppsScriptUrl(data.googleAppsScriptUrl);
+          return data.googleAppsScriptUrl;
+        }
+      }
+
+      return savedUrl;
+    } catch (err) {
+      console.error("Error loading settings from Firestore/LocalStorage:");
+      return localStorage.getItem("googleAppsScriptUrl") || "";
+    }
+  };
+
+  // 3. Load or seed exams list
+  const loadExams = async (currentUrl?: string) => {
+    setLoadingExams(true);
+    try {
+      let fetchedExams: Exam[] = [];
+
+      try {
+        const examListSnap = await getDocs(collection(db, "examList"));
+        if (!examListSnap.empty) {
+          examListSnap.forEach((docSnap) => {
+            const data = docSnap.data();
+            fetchedExams.push({
+              id: docSnap.id,
+              slNo: Number(data.slNo) || 1,
+              name: String(data.name || ""),
+              tabName: String(data.tabName || ""),
+              timeLimit: Number(data.timeLimit) || 15,
+              status: String(data.status || "draft"),
+              examDate: data.examDate ? String(data.examDate) : undefined,
+              markPerQuestion: data.markPerQuestion !== undefined ? Number(data.markPerQuestion) : 1,
+              penaltyMark: data.penaltyMark !== undefined ? Number(data.penaltyMark) : 0.25,
+              isFree: data.isFree !== undefined ? Boolean(data.isFree) : true,
+              price: data.price !== undefined ? Number(data.price) : 0,
+              showResult: data.showResult !== undefined ? Boolean(data.showResult) : false,
+              passPercentage: data.passPercentage !== undefined ? Number(data.passPercentage) : 40,
+              minPassMark: data.minPassMark !== undefined ? Number(data.minPassMark) : 0
+            });
+          });
+        }
+      } catch (fsListErr) {
+        console.error("Error loading examList from Firestore:", fsListErr);
+      }
+
+      // Sort by slNo
+      fetchedExams.sort((a, b) => a.slNo - b.slNo);
+      setExams(fetchedExams);
+    } catch (err) {
+      console.error("Error loading exams:", err);
+      setExams([]);
+    } finally {
+      setLoadingExams(false);
+    }
+  };
+
+  useEffect(() => {
+    const init = async () => {
+      const url = await loadSettings();
+      await loadExams(url);
+    };
+    init();
+  }, []);
+
+  // Listen to browser Back / Forward buttons (popstate events)
+  useEffect(() => {
+    const handlePopState = () => {
+      const targetView = getViewFromPath();
+      setCurrentView(targetView);
+    };
+
+    window.addEventListener("popstate", handlePopState);
+    return () => window.removeEventListener("popstate", handlePopState);
+  }, []);
+
+  useEffect(() => {
+    // Sync browser URL slug with current view
+    navigateToSlug(currentView);
+
+    // Dynamic page title for SEO
+    const pageTitles: Record<string, string> = {
+      home:             "Exam Master BD | BCS, সরকারি চাকরি, ব্যাংক ও প্রাথমিক পরীক্ষার অনলাইন মক টেস্ট",
+      live:             "লাইভ পরীক্ষা | BCS ও সরকারি চাকরির MCQ মক টেস্ট — Exam Master BD",
+      routine:          "পরীক্ষার রুটিন | আসন্ন BCS ও চাকরির পরীক্ষার সময়সূচি — Exam Master BD",
+      archive:          "আর্কাইভ | সম্পন্ন পরীক্ষা ও উত্তরপত্র — Exam Master BD",
+      leaderboard:      "লিডারবোর্ড | সেরা পরীক্ষার্থীদের তালিকা — Exam Master BD",
+      results:          "পরীক্ষার ফলাফল | BCS ও সরকারি চাকরি MCQ ফলাফল — Exam Master BD",
+      my_results:       "আমার ফলাফল | ব্যক্তিগত পারফরম্যান্স রিপোর্ট — Exam Master BD",
+      my_subscriptions: "আমার সাবস্ক্রিপশন — Exam Master BD",
+      pricing:          "প্রিমিয়াম প্যাকেজ | BCS ও সরকারি চাকরির সম্পূর্ণ প্রস্তুতি — Exam Master BD",
+      blog:             "ব্লগ ও গাইডলাইন | BCS প্রস্তুতির টিপস — Exam Master BD",
+      helpline:         "হেল্পলাইন | সাপোর্ট — Exam Master BD",
+      active_exam:      "পরীক্ষা চলছে — Exam Master BD",
+      admin:            "Admin Dashboard — Exam Master BD",
+    };
+    try {
+      document.title = pageTitles[currentView] ?? pageTitles.home;
+    } catch (e) {}
+
+    // Event tracking on view transitions
+    if (currentView === "home") {
+      trackEvent("home_landing", { path: "/" });
+    } else {
+      trackEvent(`${currentView}_landing`, { path: `/${currentView}` });
+    }
+  }, [currentView]);
+
+  const handleStartExam = (exam: Exam, username: string, mode: "take" | "retake" | "view_questions" | "view_result" = "take") => {
+    trackEvent("start_exam", { examId: exam.id, examName: exam.name, username, mode });
+    setActiveExam(exam);
+    setActiveCandidateName(username);
+    setActiveExamMode(mode);
+    setCurrentView("active_exam");
+  };
+
+  const handleExitExam = () => {
+    setActiveExam(null);
+    setActiveCandidateName("");
+    setActiveExamMode("take");
+    setCurrentView("home");
+    loadExams(); // Reload any updates
+    fetchUserAttempts(currentUser); // Refresh completed attempts
+  };
+
+  const handleViewLeaderboardAfterQuiz = () => {
+    setActiveExam(null);
+    setActiveCandidateName("");
+    setActiveExamMode("take");
+    setCurrentView("leaderboard");
+    fetchUserAttempts(currentUser); // Refresh completed attempts
+  };
+
+  const liveExams = exams.filter(e => e.status === "live");
+  const routineExams = exams
+    .filter(e => e.examDate && e.status !== "archived" && e.status !== "archive")
+    .sort((a, b) => parseExamDate(a.examDate) - parseExamDate(b.examDate) || a.slNo - b.slNo);
+  const archiveExams = exams.filter(e => e.status === "archived" || e.status === "archive");
+
+  return (
+    <div className="app-shell min-h-screen flex flex-col font-sans text-slate-900 dark:text-slate-100 transition-colors">
+      {/* Navbar component */}
+      {currentView === "admin" && isAdminLoggedIn ? (
+        <header className="bg-slate-900 border-b border-slate-800 sticky top-0 z-50 flex-shrink-0 text-white">
+          <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div className="flex flex-wrap justify-between items-center min-h-16 gap-2 py-2">
+              {/* Brand Logo */}
+              <div 
+                onClick={async () => {
+                  try {
+                    await signOut(auth);
+                    trackEvent("admin_navbar_logo_click");
+                  } catch (e) {
+                    console.error("Logout failed on logo click:");
+                  }
+                }}
+                className="flex items-center gap-3 cursor-pointer hover:opacity-95 transition-opacity shrink-0"
+              >
+                <div className="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center text-white shadow-sm font-black text-sm">
+                  A
+                </div>
+                <div className="hidden sm:block">
+                  <span className="text-sm font-black tracking-wider uppercase text-slate-100 flex items-center gap-1.5">
+                    <span>Admin Dashboard</span>
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
+                  </span>
+                </div>
+              </div>
+
+              {/* Navigation Items */}
+              <div className="w-full sm:w-auto sm:flex-1 min-w-0 flex flex-wrap items-center justify-center sm:justify-end gap-1.5 py-1">
+                <button
+                  onClick={() => {
+                    setActiveAdminTab("users");
+                    trackEvent("admin_nav_users_click");
+                  }}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer shrink-0 ${
+                    activeAdminTab === "users"
+                      ? "bg-blue-600 text-white"
+                      : "text-slate-400 hover:text-white hover:bg-slate-800"
+                  }`}
+                >
+                  User Management
+                </button>
+
+                <button
+                  onClick={() => {
+                    setActiveAdminTab("ads");
+                    trackEvent("admin_nav_ads_click");
+                  }}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer shrink-0 ${
+                    activeAdminTab === "ads"
+                      ? "bg-blue-600 text-white"
+                      : "text-slate-400 hover:text-white hover:bg-slate-800"
+                  }`}
+                >
+                  Ad Management
+                </button>
+
+                <button
+                  onClick={() => {
+                    setActiveAdminTab("exams");
+                    trackEvent("admin_nav_exams_click");
+                  }}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer shrink-0 ${
+                    activeAdminTab === "exams"
+                      ? "bg-blue-600 text-white"
+                      : "text-slate-400 hover:text-white hover:bg-slate-800"
+                  }`}
+                >
+                  App Settings
+                </button>
+
+                <button
+                  onClick={() => {
+                    setActiveAdminTab("exam_configs");
+                    trackEvent("admin_nav_exam_configs_click");
+                  }}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer shrink-0 ${
+                    activeAdminTab === "exam_configs"
+                      ? "bg-blue-600 text-white"
+                      : "text-slate-400 hover:text-white hover:bg-slate-800"
+                  }`}
+                >
+                  Exams & Marking
+                </button>
+
+                <button
+                  onClick={() => {
+                    setActiveAdminTab("packages");
+                    trackEvent("admin_nav_packages_click");
+                  }}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer shrink-0 ${
+                    activeAdminTab === "packages"
+                      ? "bg-blue-600 text-white"
+                      : "text-slate-400 hover:text-white hover:bg-slate-800"
+                  }`}
+                >
+                  Premium Packages
+                </button>
+
+                <button
+                  onClick={() => {
+                    setActiveAdminTab("payments");
+                    trackEvent("admin_nav_payments_click");
+                  }}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer shrink-0 ${
+                    activeAdminTab === "payments"
+                      ? "bg-blue-600 text-white"
+                      : "text-slate-400 hover:text-white hover:bg-slate-800"
+                  }`}
+                >
+                  Pending Payments
+                </button>
+
+                <button
+                  onClick={() => {
+                    setActiveAdminTab("notices");
+                    trackEvent("admin_nav_notices_click");
+                  }}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer shrink-0 ${
+                    activeAdminTab === "notices"
+                      ? "bg-blue-600 text-white"
+                      : "text-slate-400 hover:text-white hover:bg-slate-800"
+                  }`}
+                >
+                  Notice Board
+                </button>
+
+                <button
+                  onClick={() => {
+                    setActiveAdminTab("blogs");
+                    trackEvent("admin_nav_blogs_click");
+                  }}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer shrink-0 flex items-center gap-1.5 ${
+                    activeAdminTab === "blogs"
+                      ? "bg-blue-600 text-white"
+                      : "bg-emerald-500/15 text-emerald-300 hover:text-white hover:bg-emerald-500/25"
+                  }`}
+                >
+                  <BookOpen className="w-4 h-4" />
+                  Blog
+                </button>
+
+                <div className="w-[1px] h-5 bg-slate-800 mx-1 shrink-0" />
+
+                <button
+                  onClick={async () => {
+                    try {
+                      await signOut(auth);
+                      trackEvent("admin_logout_click");
+                    } catch (e) {
+                      console.error("Admin logout failed:");
+                    }
+                  }}
+                  className="px-3 py-1.5 bg-rose-600/90 hover:bg-rose-600 text-white text-xs font-bold rounded-lg transition-colors cursor-pointer shrink-0"
+                >
+                  Logout
+                </button>
+              </div>
+            </div>
+          </div>
+        </header>
+      ) : (
+        <Navbar 
+          currentUser={currentUser} 
+          onOpenAuth={() => setIsAuthOpen(true)} 
+          onViewChange={(view) => {
+            if (view === "home") {
+              trackEvent("home_click");
+            } else {
+              trackEvent(`${view}_click`);
+            }
+            const isExamActive = activeExam && (activeExamMode === "take" || activeExamMode === "retake");
+            if (isExamActive) {
+              if (window.confirm("আপনি একটি সক্রিয় পরীক্ষা দিচ্ছেন। চলে গেলে আপনার অগ্রগতি হারিয়ে যাবে। আপনি কি নিশ্চিত?")) {
+                handleExitExam();
+                setCurrentView(view as any);
+              }
+            } else {
+              if (activeExam) {
+                setActiveExam(null);
+                setActiveCandidateName("");
+                setActiveExamMode("take");
+              }
+              setCurrentView(view as any);
+            }
+          }} 
+          currentView={currentView}
+          liveCount={liveExams.length}
+          routineCount={routineExams.length}
+          archiveCount={archiveExams.length}
+          theme={theme as any}
+          toggleTheme={toggleTheme}
+        />
+      )}
+
+      {/* Main Container */}
+      <main className={`flex-grow w-full pb-10 transition-all ${
+        (currentView === "admin" && isAdminLoggedIn) 
+          ? "max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 pt-10" 
+          : "lg:pl-64 pt-10 lg:pt-24"
+      }`}>
+        <div className={(currentView === "admin" && isAdminLoggedIn) ? "" : "max-w-7xl mx-auto px-4 sm:px-6 lg:px-8"}>
+        <AnimatePresence mode="wait">
+          {currentView === "home" && (
+            <motion.div
+              key="home"
+              initial={{ opacity: 0, y: 15 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -15 }}
+              className="space-y-10"
+            >
+              {/* Introduction Hero Section */}
+              <div className="bg-white dark:bg-slate-900 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-sm p-8 sm:p-10 flex flex-col md:flex-row gap-8 items-center justify-between">
+                <div className="space-y-4 max-w-xl text-center md:text-left">
+                  <div className="inline-flex items-center gap-2 px-3 py-1 bg-blue-50 dark:bg-blue-950/30 text-blue-700 dark:text-blue-300 rounded-full text-xs font-bold font-mono uppercase tracking-wider">
+                    <Sparkles className="w-3.5 h-3.5" />
+                    <span>কঠিন প্রস্তুতি, আত্মবিশ্বাসী সাফল্য</span>
+                  </div>
+                  <h1 className="text-3xl sm:text-4xl font-extrabold text-slate-900 dark:text-white tracking-tight leading-tight">
+                    Class 1–12, BCS ও সরকারি চাকরির জন্য অনলাইন মক টেস্ট ও প্র্যাকটিস প্ল্যাটফর্ম
+                  </h1>
+                  <p className="text-[13px] font-semibold text-blue-600 dark:text-blue-400">
+                    Exam Master BD — Learn • Practice • Test • Improve • Succeed
+                  </p>
+                  <p className="text-sm text-slate-500 dark:text-slate-400 leading-relaxed">
+                    Exam Master BD হলো শিক্ষার্থী, চাকরিপ্রার্থী এবং প্রতিযোগিতামূলক পরীক্ষার্থীদের জন্য একটি আধুনিক Online MCQ Mock Test & Practice Platform। Class 1 থেকে Class 12-এর একাডেমিক পরীক্ষা, SSC ও HSC প্রস্তুতি থেকে শুরু করে BCS, সরকারি চাকরি, ব্যাংক জব, প্রাথমিক শিক্ষক নিয়োগ, NTRCA এবং বিভিন্ন প্রতিযোগিতামূলক পরীক্ষার প্রস্তুতি—সবকিছুর জন্য অনুশীলন করুন একই প্ল্যাটফর্মে।
+                  </p>
+                </div>
+
+                <div className="w-full md:w-auto max-w-xs">
+                  <div className="bg-slate-50 dark:bg-slate-850 p-6 rounded-xl border border-slate-200 dark:border-slate-800 text-center min-w-[160px]">
+                    <span className="text-xs text-blue-700 dark:text-blue-300 font-bold block uppercase tracking-wider">চলতি পরীক্ষা (Live Exams)</span>
+                    <span className="text-3xl font-black text-blue-600 dark:text-blue-400 mt-1 block">
+                      {liveExams.length}
+                    </span>
+                  </div>
+                </div>
+              </div>
+
+              {/* Carousel Banner for Ad */}
+              <AdCarousel />
+
+              <section aria-labelledby="platform-features-title" className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-6 sm:p-8 space-y-6">
+                <div className="space-y-2">
+                  <h2 id="platform-features-title" className="text-xl font-extrabold text-slate-800 dark:text-slate-100">📚 আপনার প্রস্তুতি, এক প্ল্যাটফর্মে</h2>
+                  <p className="text-sm text-slate-500 dark:text-slate-400">Exam Master BD-তে পাবেন—</p>
+                </div>
+                <ul className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 text-sm text-slate-700 dark:text-slate-300">
+                  {[
+                    "📝 অধ্যায়ভিত্তিক MCQ Practice",
+                    "🎯 বিষয়ভিত্তিক Mock Test",
+                    "📖 Class 1–12 Academic Test",
+                    "🎓 SSC & HSC Model Test",
+                    "🏛️ BCS ও সরকারি চাকরির Mock Test",
+                    "🏦 Bank Job Preparation",
+                    "👨‍🏫 Primary & NTRCA Exam Preparation",
+                    "⚡ Instant Result ও Performance Analysis",
+                    "💡 সঠিক উত্তরের বিস্তারিত ব্যাখ্যা",
+                    "🏆 Leaderboard ও Merit Ranking",
+                    "📚 নিয়মিত আপডেটেড Question Bank",
+                  ].map((feature) => (
+                    <li key={feature} className="rounded-xl bg-slate-50 dark:bg-slate-800/60 p-3">{feature}</li>
+                  ))}
+                </ul>
+              </section>
+
+              <section aria-labelledby="practice-path-title" className="bg-blue-50 dark:bg-blue-950/25 border border-blue-100 dark:border-blue-900/50 rounded-2xl p-6 sm:p-8 space-y-4">
+                <h2 id="practice-path-title" className="text-xl font-extrabold text-slate-800 dark:text-slate-100">🎓 স্কুল থেকে চাকরি—প্রস্তুতির পথ হোক আরও সহজ</h2>
+                <p className="text-sm text-slate-600 dark:text-slate-300 leading-relaxed">পরীক্ষায় ভালো করার জন্য শুধু পড়াশোনা নয়, <strong>নিয়মিত Practice ও Mock Test</strong> অত্যন্ত গুরুত্বপূর্ণ। Exam Master BD আপনাকে বাস্তব পরীক্ষার পরিবেশে নিয়মিত অনুশীলনের সুযোগ দেয়, যাতে আপনি নিজের দুর্বলতা চিহ্নিত করে প্রস্তুতিকে আরও শক্তিশালী করতে পারেন।</p>
+                <p className="text-sm font-bold text-blue-700 dark:text-blue-300">Practice করুন → ভুল খুঁজে বের করুন → নিজেকে উন্নত করুন → পরীক্ষায় এগিয়ে থাকুন।</p>
+                <div className="border-t border-blue-200 dark:border-blue-900/70 pt-4">
+                  <h3 className="text-lg font-extrabold text-slate-800 dark:text-slate-100">🚀 আজকের Practice, আগামী দিনের Success</h3>
+                  <p className="mt-1 text-sm text-slate-600 dark:text-slate-300">Exam Master BD</p>
+                  <p className="text-xs font-bold tracking-wide text-blue-700 dark:text-blue-300">Learn • Practice • Test • Improve • Succeed</p>
+                </div>
+              </section>
+              {/* User Performance Analytics / Progress Tracking Section */}
+              <UserPerformanceChart 
+                attempts={userAttempts}
+                onOpenAuth={() => setIsAuthOpen(true)}
+                isLoggedIn={!!currentUser}
+                theme={theme as any}
+              />
+            </motion.div>
+          )}
+
+          {currentView === "live" && (
+            <motion.div
+              key="live_exams"
+              initial={{ opacity: 0, y: 15 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -15 }}
+              className="space-y-6"
+            >
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-slate-200 dark:border-slate-800 pb-4">
+                <div>
+                  <h2 className="text-2xl font-black text-slate-800 dark:text-white tracking-tight flex items-center gap-2.5">
+                    <span className="relative flex h-3 w-3">
+                      <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
+                      <span className="relative inline-flex rounded-full h-3 w-3 bg-green-500"></span>
+                    </span>
+                    <span>চলতি পরীক্ষাসমূহ (Live Exams)</span>
+                  </h2>
+                  <p className="text-xs text-slate-450 dark:text-slate-400 mt-1">বর্তমানে অংশ নেওয়ার জন্য উপলব্ধ পরীক্ষাসমূহ। কুইজে অংশ নিতে নিচের পরীক্ষাটি নির্বাচন করুন।</p>
+                </div>
+                <button 
+                  onClick={() => loadExams()}
+                  className="p-2 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 hover:bg-slate-50 dark:hover:bg-slate-800 rounded-lg text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200 transition-all flex items-center gap-1.5 text-xs font-bold shrink-0 self-start sm:auto cursor-pointer font-mono"
+                  title="Reload Exams"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${loadingExams ? "animate-spin" : ""}`} />
+                  <span>রিফ্রেশ করুন</span>
+                </button>
+              </div>
+
+              {loadingExams ? (
+                <div className="py-20 text-center space-y-3">
+                  <div className="w-8 h-8 border-3 border-blue-600 border-t-transparent rounded-full animate-spin mx-auto" />
+                  <p className="text-sm text-slate-400 font-medium">পরীক্ষার সময়সূচী ডাউনলোড করা হচ্ছে...</p>
+                </div>
+              ) : (
+                liveExams.length === 0 ? (
+                  <div className="bg-white dark:bg-slate-900 rounded-2xl border border-dashed border-slate-200 dark:border-slate-800 p-12 text-center max-w-md mx-auto space-y-3 my-8">
+                    <BookOpen className="w-8 h-8 text-slate-300 dark:text-slate-700 mx-auto" />
+                    <p className="text-sm text-slate-500 dark:text-slate-400 font-medium">বর্তমানে কোনো চলতি পরীক্ষা নেই।</p>
+                    <p className="text-xs text-slate-400">পরীক্ষার রুটিন চেক করুন অথবা কুইজ লোড করতে পুনরায় চেষ্টা করুন।</p>
+                  </div>
+                ) : (
+                  <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-6">
+                    {liveExams.map((exam) => (
+                      <ExamCard
+                        key={exam.id}
+                        exam={exam}
+                        currentUser={currentUser}
+                        onStartExam={handleStartExam}
+                        isAttempted={attemptedExamIds.includes(exam.id)}
+                        isLocked={isExamLockedForUser(exam)}
+                        onUnlock={(lockedExam) => {
+                          if (!currentUser) {
+                            setIsAuthOpen(true);
+                            return;
+                          }
+                          setSelectedUnlockExam(lockedExam);
+                          setIsUnlockModalOpen(true);
+                        }}
+                      />
+                    ))}
+                  </div>
+                )
+              )}
+            </motion.div>
+          )}
+
+          {currentView === "routine" && (
+            <motion.div
+              key="routine_exams"
+              initial={{ opacity: 0, y: 15 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -15 }}
+              className="space-y-6"
+            >
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-slate-200 dark:border-slate-800 pb-4">
+                <div>
+                  <h2 className="text-2xl font-black text-slate-800 dark:text-white tracking-tight flex items-center gap-2">
+                    <Calendar className="w-6 h-6 text-blue-500" />
+                    <span>পরীক্ষার রুটিন (Exam Routine)</span>
+                  </h2>
+                  <p className="text-xs text-slate-455 dark:text-slate-400 mt-1">আসন্ন পরীক্ষার তালিকা এবং প্রকাশের তারিখ সমূহ।</p>
+                </div>
+                <button 
+                  onClick={() => loadExams()}
+                  className="p-2 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 hover:bg-slate-50 dark:hover:bg-slate-800 rounded-lg text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200 transition-all flex items-center gap-1.5 text-xs font-bold shrink-0 self-start sm:auto cursor-pointer font-mono"
+                  title="Reload Exams"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${loadingExams ? "animate-spin" : ""}`} />
+                  <span>রিফ্রেশ করুন</span>
+                </button>
+              </div>
+
+              {loadingExams ? (
+                <div className="py-20 text-center space-y-3">
+                  <div className="w-8 h-8 border-3 border-blue-600 border-t-transparent rounded-full animate-spin mx-auto" />
+                  <p className="text-sm text-slate-400 font-medium">পরীক্ষার সময়সূচী ডাউনলোড করা হচ্ছে...</p>
+                </div>
+              ) : (
+                <>
+                  {routineExams.length === 0 ? (
+                    <div className="bg-white dark:bg-slate-900 rounded-2xl border border-dashed border-slate-200 dark:border-slate-800 p-12 text-center max-w-md mx-auto space-y-3 my-8">
+                      <Calendar className="w-8 h-8 text-slate-300 dark:text-slate-700 mx-auto" />
+                      <p className="text-sm text-slate-500 dark:text-slate-400 font-medium">কোনো পরীক্ষার রুটিন নির্ধারিত নেই।</p>
+                      <p className="text-xs text-slate-400">অনুগ্র করে পরবর্তী পরীক্ষার তারিখ চেক করুন।</p>
+                    </div>
+                  ) : (
+                    <div className="bg-white dark:bg-slate-900 border border-slate-150 dark:border-slate-800 rounded-3xl p-4 sm:p-6 shadow-sm overflow-hidden">
+                      <div className="overflow-x-auto rounded-2xl border border-slate-100 dark:border-slate-800">
+                        <table className="w-full text-left border-collapse text-xs">
+                          <thead>
+                            <tr className="bg-slate-50 dark:bg-slate-800/40 text-slate-600 dark:text-slate-350 font-bold border-b border-slate-100 dark:border-slate-800 uppercase">
+                              <th className="py-4 px-4 font-bold text-[13px]">পরীক্ষার দিন</th>
+                              <th className="py-4 px-4 font-bold text-[13px]">তারিখ</th>
+                              <th className="py-4 px-4 font-bold text-[13px]">পরীক্ষার নাম</th>
+                              <th className="py-4 px-4 font-bold text-[13px] text-center">সময়সীমা ও পূর্ণমান</th>
+                              <th className="py-4 px-4 font-bold text-[13px] text-center">ফি</th>
+                              <th className="py-4 px-4 font-bold text-[13px] text-center">অ্যাকশন / অবস্থা</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-slate-100 dark:divide-slate-800 text-slate-650 dark:text-slate-300">
+                            {routineExams.map((exam) => {
+                              const { dayName, formattedDate } = getBanglaDayAndDate(exam.examDate);
+                              const isLive = exam.status === "live";
+                              const isAttempted = attemptedExamIds.includes(exam.id);
+                              const isLocked = isExamLockedForUser(exam);
+                              const isFree = exam.isFree !== false;
+                              
+                              return (
+                                <tr key={exam.id} className="hover:bg-slate-50/50 dark:hover:bg-slate-800/20 transition-all">
+                                  <td className="py-4 px-4 font-bold text-indigo-650 dark:text-indigo-400 text-xs whitespace-nowrap">
+                                    {dayName}
+                                  </td>
+                                  <td className="py-4 px-4 font-semibold text-slate-500 dark:text-slate-400 font-mono text-xs whitespace-nowrap">
+                                    {formattedDate}
+                                  </td>
+                                  <td className="py-4 px-4">
+                                    <div className="space-y-1">
+                                      <p className="font-bold text-slate-800 dark:text-slate-100 text-xs sm:text-sm max-w-sm line-clamp-2 leading-relaxed">
+                                        {exam.name}
+                                      </p>
+                                      <div className="flex items-center gap-1.5">
+                                        <span className={`text-[11px] font-black uppercase tracking-wider px-1.5 py-0.5 rounded ${
+                                          isLive 
+                                            ? "bg-green-100 dark:bg-green-950/40 text-green-700 dark:text-green-400" 
+                                            : "bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400"
+                                        }`}>
+                                          {isLive ? "চলতি পরীক্ষা" : "আসন্ন পরীক্ষা"}
+                                        </span>
+                                      </div>
+                                    </div>
+                                  </td>
+                                  <td className="py-4 px-4 font-mono font-bold text-center whitespace-nowrap">
+                                    <div className="space-y-0.5">
+                                      <span className="text-xs">{exam.timeLimit} মিনিট</span>
+                                      {exam.questionCount !== undefined && exam.questionCount > 0 && (
+                                        <span className="block text-[12px] text-slate-400 font-medium">({exam.questionCount}টি প্রশ্ন)</span>
+                                      )}
+                                    </div>
+                                  </td>
+                                  <td className="py-4 px-4 text-center whitespace-nowrap">
+                                    {!isFree ? (
+                                      <span className="text-[12px] font-bold px-2 py-0.5 rounded bg-amber-50 dark:bg-amber-950/30 text-amber-700 dark:text-amber-400 border border-amber-100/50 dark:border-amber-900/30 font-mono">
+                                        {exam.price} ৳
+                                      </span>
+                                    ) : (
+                                      <span className="text-[12px] font-bold px-2 py-0.5 rounded bg-emerald-50 dark:bg-emerald-950/30 text-emerald-700 dark:text-emerald-400 border border-emerald-100/50 dark:border-emerald-900/30">
+                                        ফ্রি
+                                      </span>
+                                    )}
+                                  </td>
+                                  <td className="py-4 px-4 text-center whitespace-nowrap content-center">
+                                    {!isLive ? (
+                                      <span className="inline-flex items-center gap-1.5 px-3 py-1 bg-slate-50 dark:bg-slate-800 text-slate-450 rounded-lg text-[13px] font-bold">
+                                        <Clock className="w-3.5 h-3.5 text-slate-400" />
+                                        <span>অপ্রকাশিত (আসন্ন)</span>
+                                      </span>
+                                    ) : isAttempted ? (
+                                      <div className="flex items-center justify-center gap-1.5">
+                                        {exam.showResult && (
+                                          <button
+                                            onClick={() => {
+                                              const name = currentUser?.displayName || currentUser?.email?.split("@")[0] || "পরীক্ষার্থী";
+                                              handleStartExam(exam, name, "view_result");
+                                              trackEvent("routine_view_result_click");
+                                            }}
+                                            className="px-2.5 py-1.5 bg-blue-50 hover:bg-blue-100 dark:bg-blue-950/20 dark:hover:bg-blue-900/30 text-blue-700 dark:text-blue-400 font-bold rounded-lg text-[12px] flex items-center gap-1 border border-blue-100 dark:border-blue-900/40 cursor-pointer"
+                                            title="ফলাফল দেখুন"
+                                          >
+                                            <Award className="w-3.5 h-3.5 text-blue-500" />
+                                            <span>ফলাফল</span>
+                                          </button>
+                                        )}
+                                        <button
+                                          onClick={() => {
+                                            const name = currentUser?.displayName || currentUser?.email?.split("@")[0] || "পরীক্ষার্থী";
+                                            handleStartExam(exam, name, "view_questions");
+                                            trackEvent("routine_view_questions_click");
+                                          }}
+                                          className="px-2.5 py-1.5 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 font-bold rounded-lg text-[12px] flex items-center gap-1 cursor-pointer"
+                                          title="প্রশ্ন ও সমাধান দেখুন"
+                                        >
+                                          <HelpCircle className="w-3.5 h-3.5 text-slate-500" />
+                                          <span>প্রশ্ন</span>
+                                        </button>
+                                        <button
+                                          onClick={() => {
+                                            const name = currentUser?.displayName || currentUser?.email?.split("@")[0] || "পরীক্ষার্থী";
+                                            handleStartExam(exam, name, "retake");
+                                            trackEvent("routine_retake_click");
+                                          }}
+                                          className="px-2.5 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white font-bold rounded-lg text-[12px] flex items-center gap-1 cursor-pointer"
+                                          title="পুনরায় পরীক্ষা দিন"
+                                        >
+                                          <RefreshCw className="w-3.5 h-3.5" />
+                                          <span>পুনরায়</span>
+                                        </button>
+                                      </div>
+                                    ) : isLocked ? (
+                                      <button
+                                        onClick={() => {
+                                          if (!currentUser) {
+                                            setIsAuthOpen(true);
+                                            return;
+                                          }
+                                          setSelectedUnlockExam(exam);
+                                          setIsUnlockModalOpen(true);
+                                          trackEvent("routine_unlock_click");
+                                        }}
+                                        className="px-3.5 py-1.5 bg-gradient-to-r from-amber-500 to-orange-600 hover:from-amber-600 hover:to-orange-700 text-white font-bold rounded-lg text-xs flex items-center gap-1.5 shadow-xs cursor-pointer"
+                                      >
+                                        <Lock className="w-3 h-3" />
+                                        <span>আনলক করুন ({exam.price} ৳)</span>
+                                      </button>
+                                    ) : (
+                                      <button
+                                        onClick={() => {
+                                          trackEvent("routine_start_exam_click");
+                                          if (currentUser) {
+                                            handleStartExam(exam, currentUser.displayName || currentUser.email.split("@")[0]);
+                                          } else {
+                                            setGuestExamToStart(exam);
+                                          }
+                                        }}
+                                        className="px-4 py-1.5 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded-lg text-xs flex items-center gap-1 shadow-xs cursor-pointer"
+                                      >
+                                        <span>অংশ নিন</span>
+                                        <ChevronRight className="w-3.5 h-3.5" />
+                                      </button>
+                                    )}
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                      
+                      <div className="bg-amber-50/50 dark:bg-amber-950/10 border border-amber-100 dark:border-amber-900/30 rounded-2xl p-4 text-[13px] text-amber-700 dark:text-amber-400 leading-relaxed mt-5">
+                       <p> 💡 <b className="text-green-500">রুটিন নির্দেশিকা:</b> নির্ধারিত দিনে সংশ্লিষ্ট পরীক্ষাটি চালু করা হবে। পরীক্ষা শেষ হওয়ার পর প্রতিটি প্রশ্নের সমাধান ও ফলাফল স্বয়ংক্রিয়ভাবে প্রকাশ পাবে। 
+                        <br />আপনার ফলাফল দেখুন <b className="text-red-500">আমার ফলাফল</b> ট্যাব-এ, সেন্ট্রাল রেজাল্ট দেখুন <b className="text-red-500">Result</b> ট্যাব-এ।</p>
+                      </div>
+                    </div>
+                  )}
+                </>
+              )}
+            </motion.div>
+          )}
+
+          {currentView === "archive" && (
+            <motion.div
+              key="archive_exams"
+              initial={{ opacity: 0, y: 15 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -15 }}
+              className="space-y-6"
+            >
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-slate-200 dark:border-slate-800 pb-4">
+                <div>
+                  <h2 className="text-2xl font-black text-slate-800 dark:text-white tracking-tight flex items-center gap-2">
+                    <Archive className="w-6 h-6 text-slate-500" />
+                    <span>আর্কাইভ পরীক্ষা (Archive Exams)</span>
+                  </h2>
+                  <p className="text-xs text-slate-450 dark:text-slate-400 mt-1">পূর্ববর্তী সময়ে সমাপ্ত হওয়া পরীক্ষাসমূহের আর্কাইভ তালিকা।</p>
+                </div>
+                <button 
+                  onClick={() => loadExams()}
+                  className="p-2 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 hover:bg-slate-50 dark:hover:bg-slate-800 rounded-lg text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200 transition-all flex items-center gap-1.5 text-xs font-bold shrink-0 self-start sm:auto cursor-pointer font-mono"
+                  title="Reload Exams"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${loadingExams ? "animate-spin" : ""}`} />
+                  <span>রিফ্রেশ করুন</span>
+                </button>
+              </div>
+
+              {loadingExams ? (
+                <div className="py-20 text-center space-y-3">
+                  <div className="w-8 h-8 border-3 border-blue-600 border-t-transparent rounded-full animate-spin mx-auto" />
+                  <p className="text-sm text-slate-400 font-medium">পরীক্ষার সময়সূচী ডাউনলোড করা হচ্ছে...</p>
+                </div>
+              ) : (
+                archiveExams.length === 0 ? (
+                  <div className="bg-white dark:bg-slate-900 rounded-2xl border border-dashed border-slate-200 dark:border-slate-800 p-12 text-center max-w-md mx-auto space-y-3 my-8">
+                    <Archive className="w-8 h-8 text-slate-300 dark:text-slate-700 mx-auto" />
+                    <p className="text-sm text-slate-500 dark:text-slate-400 font-medium">আর্কাইভ করা কোনো পরীক্ষা পাওয়া যায়নি।</p>
+                    <p className="text-xs text-slate-400">পরীক্ষা আর্কাইভ করতে গুগল শিটের status কলামে archive অথবা archived লিখুন।</p>
+                  </div>
+                ) : (
+                  <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-6">
+                    {archiveExams.map((exam) => (
+                      <ExamCard
+                        key={exam.id}
+                        exam={exam}
+                        currentUser={currentUser}
+                        onStartExam={handleStartExam}
+                        isAttempted={attemptedExamIds.includes(exam.id)}
+                        isLocked={isExamLockedForUser(exam)}
+                        onUnlock={(lockedExam) => {
+                          if (!currentUser) {
+                            setIsAuthOpen(true);
+                            return;
+                          }
+                          setSelectedUnlockExam(lockedExam);
+                          setIsUnlockModalOpen(true);
+                        }}
+                      />
+                    ))}
+                  </div>
+                )
+              )}
+            </motion.div>
+          )}
+
+          {currentView === "active_exam" && activeExam && (
+            <motion.div
+              key="active_exam"
+              initial={{ opacity: 0, scale: 0.98 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.98 }}
+            >
+              <ActiveExam
+                exam={activeExam}
+                username={activeCandidateName}
+                currentUser={currentUser}
+                googleAppsScriptUrl={googleAppsScriptUrl}
+                onExit={handleExitExam}
+                onViewLeaderboard={handleViewLeaderboardAfterQuiz}
+                onNavigatePricing={() => {
+                  handleExitExam();
+                  setCurrentView("pricing");
+                  navigateToSlug("pricing");
+                }}
+                mode={activeExamMode}
+                userPremiumUntil={userPremiumUntil}
+                isAdmin={isAdminLoggedIn}
+              />
+            </motion.div>
+          )}
+
+          {currentView === "leaderboard" && (
+            <motion.div
+              key="leaderboard"
+              initial={{ opacity: 0, y: 15 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -15 }}
+            >
+              <Leaderboard exams={exams} />
+            </motion.div>
+          )}
+
+          {currentView === "results" && (
+            <motion.div
+              key="results"
+              initial={{ opacity: 0, y: 15 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -15 }}
+            >
+              <Results exams={exams} />
+            </motion.div>
+          )}
+
+          {currentView === "pricing" && (
+            <motion.div
+              key="pricing"
+              initial={{ opacity: 0, y: 15 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -15 }}
+            >
+              <Pricing 
+                currentUser={currentUser} 
+                onOpenAuth={() => setIsAuthOpen(true)} 
+                onSuccessPayment={() => {
+                  if (currentUser) {
+                    fetchUserPremiumAndSubscriptions(currentUser);
+                  }
+                }}
+              />
+            </motion.div>
+          )}
+
+          {currentView === "my_results" && (
+            <motion.div
+              key="my_results"
+              initial={{ opacity: 0, y: 15 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -15 }}
+            >
+              <MyResults 
+                currentUser={currentUser} 
+                onOpenAuth={() => setIsAuthOpen(true)}
+                exams={exams}
+              />
+            </motion.div>
+          )}
+
+          {currentView === "my_subscriptions" && (
+            <motion.div
+              key="my_subscriptions"
+              initial={{ opacity: 0, y: 15 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -15 }}
+            >
+              <MySubscriptions 
+                currentUser={currentUser} 
+                onOpenAuth={() => setIsAuthOpen(true)}
+                onViewChange={(view) => setCurrentView(view)}
+              />
+            </motion.div>
+          )}
+
+          {currentView === "blog" && (
+            <motion.div
+              key="blog"
+              initial={{ opacity: 0, y: 15 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -15 }}
+            >
+              <BlogUser />
+            </motion.div>
+          )}
+
+          {currentView === "helpline" && (
+            <motion.div
+              key="helpline"
+              initial={{ opacity: 0, y: 15 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -15 }}
+            >
+              <Helpline />
+            </motion.div>
+          )}
+
+          {currentView === "admin" && (
+            <motion.div
+              key="admin"
+              initial={{ opacity: 0, y: 15 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -15 }}
+              className="max-w-6xl mx-auto"
+            >
+              {!isAdminLoggedIn ? (
+                <AdminLogin 
+                  onLoginSuccess={() => {
+                    setIsAdminLoggedIn(true);
+                  }}
+                  onBackToHome={() => {
+                    setCurrentView("home");
+                  }}
+                />
+              ) : (
+                <div className="space-y-6">
+                  {activeAdminTab === "users" && (
+                    <UserManagement />
+                  )}
+                  {activeAdminTab === "ads" && (
+                    <AdManagement />
+                  )}
+                  {activeAdminTab === "exams" && (
+                    <AdminSettings 
+                      onSettingsSaved={async () => {
+                        const url = await loadSettings();
+                        await loadExams(url);
+                      }}
+                      onReloadExams={async () => {
+                        const url = await loadSettings();
+                        await loadExams(url);
+                      }}
+                    />
+                  )}
+                  {activeAdminTab === "exam_configs" && (
+                    <AdminExamsSettings 
+                      exams={exams}
+                      onReload={async () => {
+                        const url = await loadSettings();
+                        await loadExams(url);
+                      }}
+                    />
+                  )}
+                  {activeAdminTab === "packages" && (
+                    <AdminPackagesSettings />
+                  )}
+                  {activeAdminTab === "payments" && (
+                    <PendingPayments />
+                  )}
+                  {activeAdminTab === "notices" && (
+                    <AdminNotices />
+                  )}
+                  {activeAdminTab === "blogs" && (
+                    <AdminBlogManager />
+                  )}
+                </div>
+              )}
+            </motion.div>
+          )}
+        </AnimatePresence>
+        </div>
+      </main>
+
+      {/* Footer About, Socials, & Copyright */}
+      <footer className={`bg-white dark:bg-slate-900 border-t border-slate-200 dark:border-slate-800 mt-16 flex-shrink-0 transition-all duration-300 ${
+        (currentView === "admin" && isAdminLoggedIn) ? "" : "lg:pl-64"
+      }`}>
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-10">
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-8 pb-8 border-b border-slate-100 dark:border-slate-800">
+            {/* About Section */}
+            <div className="space-y-3">
+              <h3 className="text-sm font-bold text-slate-800 dark:text-slate-200 uppercase tracking-wider">Exam Master BD</h3>
+              <p className="text-xs text-slate-500 dark:text-slate-400 leading-relaxed">
+               Exam Master BD একটি প্রযুক্তিনির্ভর অনলাইন পরীক্ষা প্রস্তুতি প্ল্যাটফর্ম, যার লক্ষ্য শিক্ষার্থী ও চাকরি প্রত্যাশীদের জন্য সহজ, নির্ভুল এবং কার্যকর অনুশীলনের সুযোগ তৈরি করা। আমরা মানসম্মত প্রশ্ন, বাস্তবধর্মী মডেল টেস্ট, ফলাফল বিশ্লেষণ এবং নিয়মিত আপডেটের মাধ্যমে প্রতিটি পরীক্ষার্থীর প্রস্তুতিকে আরও শক্তিশালী করতে কাজ করছি। আমাদের বিশ্বাস, সঠিক পরিকল্পনা ও নিয়মিত অনুশীলনই সফলতার মূল চাবিকাঠি।
+              </p>
+            </div>
+
+            {/* Quick Stats/Links */}
+            <div className="space-y-3">
+              <h3 className="text-sm font-bold text-slate-800 dark:text-slate-200 uppercase tracking-wider">Quick Links</h3>
+              <ul className="text-xs text-slate-500 dark:text-slate-400 space-y-2">
+                <li>
+                  <button onClick={() => {
+                    const isExamActive = activeExam && (activeExamMode === "take" || activeExamMode === "retake");
+                    if (isExamActive) {
+                      if (window.confirm("আপনি একটি সক্রিয় পরীক্ষা দিচ্ছেন। চলে গেলে আপনার অগ্রগতি হারিয়ে যাবে। আপনি কি নিশ্চিত?")) {
+                        handleExitExam();
+                        setCurrentView("live");
+                        setActiveExamTab("live");
+                      }
+                    } else {
+                      if (activeExam) {
+                        setActiveExam(null);
+                        setActiveCandidateName("");
+                        setActiveExamMode("take");
+                      }
+                      setCurrentView("live");
+                      setActiveExamTab("live");
+                    }
+                  }} className="hover:text-blue-600 dark:hover:text-blue-400 transition-colors cursor-pointer text-left">
+                    • Live Exam
+                  </button>
+                </li>
+                <li>
+                  <button onClick={() => {
+                    const isExamActive = activeExam && (activeExamMode === "take" || activeExamMode === "retake");
+                    if (isExamActive) {
+                      if (window.confirm("আপনি একটি সক্রিয় পরীক্ষা দিচ্ছেন। চলে গেলে আপনার অগ্রগতি হারিয়ে যাবে। আপনি কি নিশ্চিত?")) {
+                        handleExitExam();
+                        setCurrentView("routine");
+                        setActiveExamTab("routine");
+                      }
+                    } else {
+                      if (activeExam) {
+                        setActiveExam(null);
+                        setActiveCandidateName("");
+                        setActiveExamMode("take");
+                      }
+                      setCurrentView("routine");
+                      setActiveExamTab("routine");
+                    }
+                  }} className="hover:text-blue-600 dark:hover:text-blue-400 transition-colors cursor-pointer text-left">
+                    • Exam Routine
+                  </button>
+                </li>
+                <li>
+                  <button onClick={() => {
+                    const isExamActive = activeExam && (activeExamMode === "take" || activeExamMode === "retake");
+                    if (isExamActive) {
+                      if (window.confirm("আপনি একটি সক্রিয় পরীক্ষা দিচ্ছেন। চলে গেলে আপনার অগ্রগতি হারিয়ে যাবে। আপনি কি নিশ্চিত?")) {
+                        handleExitExam();
+                        setCurrentView("archive");
+                        setActiveExamTab("archive");
+                      }
+                    } else {
+                      if (activeExam) {
+                        setActiveExam(null);
+                        setActiveCandidateName("");
+                        setActiveExamMode("take");
+                      }
+                      setCurrentView("archive");
+                      setActiveExamTab("archive");
+                    }
+                  }} className="hover:text-blue-600 dark:hover:text-blue-400 transition-colors cursor-pointer text-left">
+                    • Archive
+                  </button>
+                </li>
+                <li>
+                  <button onClick={() => {
+                    const isExamActive = activeExam && (activeExamMode === "take" || activeExamMode === "retake");
+                    if (isExamActive) {
+                      if (window.confirm("আপনি একটি সক্রিয় পরীক্ষা দিচ্ছেন। চলে গেলে আপনার অগ্রগতি হারিয়ে যাবে। আপনি কি নিশ্চিত?")) {
+                        handleExitExam();
+                        setCurrentView("leaderboard");
+                      }
+                    } else {
+                      if (activeExam) {
+                        setActiveExam(null);
+                        setActiveCandidateName("");
+                        setActiveExamMode("take");
+                      }
+                      setCurrentView("leaderboard");
+                    }
+                  }} className="hover:text-blue-600 dark:hover:text-blue-400 transition-colors cursor-pointer text-left">
+                    • Leaderboard
+                  </button>
+                </li>
+                <li>
+                  <button onClick={() => {
+                    const isExamActive = activeExam && (activeExamMode === "take" || activeExamMode === "retake");
+                    if (isExamActive) {
+                      if (window.confirm("আপনি একটি সক্রিয় পরীক্ষা দিচ্ছেন। চলে গেলে আপনার অগ্রগতি হারিয়ে যাবে। আপনি কি নিশ্চিত?")) {
+                        handleExitExam();
+                        setCurrentView("helpline");
+                      }
+                    } else {
+                      if (activeExam) {
+                        setActiveExam(null);
+                        setActiveCandidateName("");
+                        setActiveExamMode("take");
+                      }
+                      setCurrentView("helpline");
+                    }
+                  }} className="hover:text-blue-600 dark:hover:text-blue-400 transition-colors cursor-pointer text-left">
+                    • Helpline
+                  </button>
+                </li>
+              </ul>
+            </div>
+
+            {/* Social Media & Contact */}
+            <div className="space-y-4">
+              <h3 className="text-sm font-bold text-slate-800 dark:text-slate-200 uppercase tracking-wider">Connect & Support</h3>
+              <div className="space-y-3">
+                {/* Facebook Page */}
+                <a
+                  href="https://www.facebook.com/profile.php?id=61593732495675"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="flex items-center gap-3 group"
+                >
+                  <div className="w-9 h-9 bg-[#1877F2] rounded-lg flex items-center justify-center shrink-0 shadow-sm group-hover:brightness-110 transition-all">
+                    <Facebook className="w-4.5 h-4.5 text-white" />
+                  </div>
+                  <div>
+                    <p className="text-xs font-bold text-slate-800 dark:text-slate-200 group-hover:text-blue-600 dark:group-hover:text-blue-400 transition-colors">Follow Facebook Page</p>
+                    <p className="text-[11px] text-slate-400 dark:text-slate-500">আমাদের পেজ ফলো করুন</p>
+                  </div>
+                </a>
+                {/* Facebook Group */}
+                <a
+                  href="https://www.facebook.com/groups/1844789803183823"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="flex items-center gap-3 group"
+                >
+                  <div className="w-9 h-9 bg-[#1877F2] rounded-lg flex items-center justify-center shrink-0 shadow-sm group-hover:brightness-110 transition-all">
+                    <Users className="w-4.5 h-4.5 text-white" />
+                  </div>
+                  <div>
+                    <p className="text-xs font-bold text-slate-800 dark:text-slate-200 group-hover:text-blue-600 dark:group-hover:text-blue-400 transition-colors">Join Facebook Group</p>
+                    <p className="text-[11px] text-slate-400 dark:text-slate-500">গ্রুপে যোগ দিন</p>
+                  </div>
+                </a>
+                {/* Support Email */}
+                <div className="flex items-center gap-3">
+                  <div className="w-9 h-9 bg-slate-100 dark:bg-slate-800 rounded-lg flex items-center justify-center shrink-0">
+                    <Mail className="w-4.5 h-4.5 text-slate-500 dark:text-slate-400" />
+                  </div>
+                  <div>
+                    <p className="text-xs font-bold text-slate-800 dark:text-slate-200">Support Contact</p>
+                    <a
+                      href="mailto:support.examnest@gmail.com"
+                      className="text-[11px] text-blue-500 hover:text-blue-600 dark:text-blue-400 dark:hover:text-blue-300 hover:underline transition-colors"
+                    >
+                      support.examnest@gmail.com
+                    </a>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div className="pt-8 flex flex-col sm:flex-row items-center justify-between text-[13px] text-slate-400 dark:text-slate-500 font-bold uppercase tracking-widest gap-4">
+            <div>Exam Master BD © {new Date().getFullYear()}</div>
+            <div>সিস্টেম স্ট্যাটাস (System Status): <span className="text-green-600">সংযুক্ত (Connected)</span></div>
+          </div>
+        </div>
+      </footer>
+
+      {/* Guest Name Modal */}
+      {guestExamToStart && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 0.5 }}
+            className="absolute inset-0 bg-slate-900/60 backdrop-blur-xs"
+            onClick={() => {
+              setGuestExamToStart(null);
+              setGuestName("");
+              setGuestError("");
+            }}
+          />
+          <motion.div
+            initial={{ opacity: 0, scale: 0.95 }}
+            animate={{ opacity: 1, scale: 1 }}
+            className="relative w-full max-w-md bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-3xl shadow-2xl p-6 space-y-4 text-left z-10"
+          >
+            <h3 className="text-base font-black text-slate-800 dark:text-white">পরীক্ষায় অংশ নিন (Guest Access)</h3>
+            <p className="text-xs text-slate-500">আপনার পরীক্ষা এবং অগ্রগতি ট্র্যাক করতে আপনার ডাকনাম লিখুন।</p>
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                if (!guestName.trim()) {
+                  setGuestError("পরীক্ষার্থীর নাম আবশ্যক।");
+                  return;
+                }
+                if (guestName.trim().length < 2) {
+                  setGuestError("নাম অন্তত ২ অক্ষরের হতে হবে।");
+                  return;
+                }
+                const nameToUse = guestName.trim();
+                const exam = guestExamToStart;
+                setGuestExamToStart(null);
+                setGuestName("");
+                setGuestError("");
+                handleStartExam(exam, nameToUse);
+              }}
+              className="space-y-4"
+            >
+              <div className="space-y-1.5">
+                <label className="text-[12px] font-bold text-slate-500 uppercase tracking-wider block">আপনার নাম লিখুন</label>
+                <input
+                  type="text"
+                  required
+                  value={guestName}
+                  onChange={(e) => setGuestName(e.target.value)}
+                  placeholder="যেমন: সাকিব হাসান"
+                  className="w-full px-3.5 py-2.5 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg text-xs text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-500 font-semibold"
+                />
+              </div>
+              {guestError && (
+                <p className="text-[13px] font-medium text-rose-600">
+                  {guestError}
+                </p>
+              )}
+              <div className="flex gap-2 pt-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setGuestExamToStart(null);
+                    setGuestName("");
+                    setGuestError("");
+                  }}
+                  className="flex-1 py-2.5 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-600 dark:text-slate-300 font-bold rounded-xl text-xs transition-colors cursor-pointer"
+                >
+                  বাতিল করুন
+                </button>
+                <button
+                  type="submit"
+                  className="flex-1 py-2.5 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded-xl text-xs shadow-sm transition-all cursor-pointer"
+                >
+                  শুরু করুন
+                </button>
+              </div>
+            </form>
+          </motion.div>
+        </div>
+      )}
+
+      {/* Auth Modal component */}
+      <AuthModal 
+        isOpen={isAuthOpen} 
+        onClose={() => setIsAuthOpen(false)} 
+        currentUser={currentUser} 
+        userAttempts={userAttempts}
+        exams={exams}
+      />
+
+      {/* Payment Modal for unlocked exams */}
+      {selectedUnlockExam && (
+        <PaymentModal
+          isOpen={isUnlockModalOpen}
+          onClose={() => {
+            setIsUnlockModalOpen(false);
+            setSelectedUnlockExam(null);
+          }}
+          currentUser={currentUser}
+          paymentType="exam"
+          price={selectedUnlockExam.price || 0}
+          productName={selectedUnlockExam.name}
+          productId={selectedUnlockExam.id}
+          onSuccess={() => {
+            if (currentUser) {
+              fetchUserPremiumAndSubscriptions(currentUser);
+            }
+          }}
+        />
+      )}
+    </div>
+  );
+}

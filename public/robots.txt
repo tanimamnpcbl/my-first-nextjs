@@ -1,0 +1,15 @@
+# Exam Master BD — BCS ও সরকারি চাকরির অনলাইন মক টেস্ট প্ল্যাটফর্ম
+# https://jobexamnest.vercel.app/sitemap.xml
+
+User-agent: *
+Allow: /
+
+# Block admin portal from indexing
+Disallow: /admin
+
+# Block API/internal paths
+Disallow: /api/
+Disallow: /__/
+
+# Sitemap location
+Sitemap: https://jobexamnest.vercel.app/sitemap.xml

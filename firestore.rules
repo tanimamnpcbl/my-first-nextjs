@@ -1,0 +1,86 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isAdmin() {
+      return isAuthenticated()
+        && exists(/databases/$(database)/documents/admin/$(request.auth.uid))
+        && get(/databases/$(database)/documents/admin/$(request.auth.uid)).data.role == 'admin';
+    }
+
+    // Public mock tests
+    match /examList/{examId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    // Exam attempts & rankings
+    match /attempts/{attemptId} {
+      allow read: if true;
+      allow create: if request.resource.data.examId is string;
+      allow update, delete: if false;
+    }
+
+    // Subscription packages
+    match /packages/{packageId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    // Study guidelines & blogs
+    match /blogs/{blogId} {
+      allow read: if true;
+      allow create, delete: if isAdmin();
+      allow update: if isAdmin()
+        || request.resource.data.diff(resource.data).affectedKeys().hasOnly(['blogViewCount']);
+    }
+
+    // Payment submissions
+    match /transactions/{transactionId} {
+      allow read: if true;
+      allow create: if isAuthenticated()
+        && request.resource.data.transactionId is string
+        && request.resource.data.userId == request.auth.uid;
+      allow update, delete: if isAdmin();
+    }
+
+    // Settings (Apps Script URL, helpline numbers)
+    match /settings/{settingId} {
+      // Keep the legacy admin credential document out of public reads.
+      allow read: if settingId != 'admin' || isAdmin();
+      allow write: if isAdmin();
+    }
+
+    // Public notices managed from the admin dashboard.
+    match /notices/{noticeId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    // Admins can only read their own pre-provisioned admin record.
+    // Admin records must be created by a trusted project owner in Firebase Console.
+    match /admin/{uid} {
+      allow get: if isOwner(uid);
+      allow list, create, update, delete: if false;
+    }
+
+    // User profiles & subscriptions
+    match /users/{userId} {
+      allow read: if true;
+      allow create, update: if isOwner(userId) || isAdmin();
+      allow delete: if isAdmin();
+
+      match /subscriptions/{subscriptionId} {
+        allow read: if true;
+        allow write: if isOwner(userId) || isAdmin();
+      }
+    }
+  }
+}
