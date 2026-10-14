@@ -1,5 +1,5 @@
 import { initializeApp } from "firebase/app";
-import { getFirestore, doc, getDocFromServer } from "firebase/firestore";
+import { getFirestore } from "firebase/firestore";
 import { getAuth } from "firebase/auth";
 
 // Support environment variables with default fallback
@@ -22,19 +22,6 @@ export const db = databaseId ? getFirestore(app, databaseId) : getFirestore(app)
 
 // Initialize Authentication
 export const auth = getAuth(app);
-
-// Validate connection to Firestore on boot
-async function testConnection() {
-  try {
-    await getDocFromServer(doc(db, "test", "connection"));
-  } catch (error) {
-    if (error instanceof Error && error.message.includes("client is offline")) {
-      console.warn("Firebase client is offline. Firestore connection will resume when online.");
-    }
-  }
-}
-
-testConnection();
 
 export enum OperationType {
   CREATE = "create",

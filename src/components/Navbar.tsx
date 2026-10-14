@@ -34,8 +34,8 @@ export default function Navbar({
 }: NavbarProps) {
   const [isOpen, setIsOpen] = useState(false);
 
-  // Real-time notices state
-  const [notices, setNotices] = useState<any[]>([]);
+  // Keep a single notice subscription for this mounted navbar.
+  const [allLiveNotices, setAllLiveNotices] = useState<any[]>([]);
   const [isNoticeOpen, setIsNoticeOpen] = useState(false);
   const [selectedNotice, setSelectedNotice] = useState<any>(null);
   const [readNoticeIds, setReadNoticeIds] = useState<string[]>(() => {
@@ -47,7 +47,7 @@ export default function Navbar({
     }
   });
 
-  // Listen to live notices real-time
+  // Subscribe once; filtering by the signed-in user is done locally below.
   useEffect(() => {
     const q = query(collection(db, "notices"), where("isLive", "==", true));
     const unsubscribe = onSnapshot(q, (snapshot) => {
@@ -57,16 +57,16 @@ export default function Navbar({
       });
       // Sort newest first by createdAt
       list.sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
-      
-      // Filter client side based on currentUser
-      const userId = currentUser?.uid;
-      const filtered = list.filter((n) => n.user === "all" || (userId && n.user === userId));
-      setNotices(filtered);
+      setAllLiveNotices(list);
     }, (err) => {
       console.error("Error listening to notices:");
     });
     return () => unsubscribe();
-  }, [currentUser]);
+  }, []);
+
+  const notices = allLiveNotices.filter((notice) =>
+    notice.user === "all" || (currentUser?.uid && notice.user === currentUser.uid)
+  );
 
   const unreadCount = notices.filter(n => !readNoticeIds.includes(n.id)).length;
 

@@ -464,7 +464,6 @@ export default function App() {
     setActiveCandidateName("");
     setActiveExamMode("take");
     setCurrentView("home");
-    loadExams(); // Reload any updates
     fetchUserAttempts(currentUser); // Refresh completed attempts
   };
 

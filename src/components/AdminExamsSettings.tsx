@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from "react";
-import { doc, setDoc, collection, getDocs, deleteDoc } from "firebase/firestore";
+import { doc, setDoc, deleteDoc } from "firebase/firestore";
 import { db } from "../firebase";
 import { trackEvent } from "../lib/analytics";
 import { 
@@ -76,45 +76,24 @@ export default function AdminExamsSettings({ exams, onReload }: AdminExamsSettin
   // Custom confirmation dialog
   const [deleteConfirm, setDeleteConfirm] = useState<Exam | null>(null);
 
-  // Load from firestore
-  const fetchExams = async () => {
-    setLoading(true);
-    setError("");
-    try {
-      const snap = await getDocs(collection(db, "examList"));
-      const list: Exam[] = [];
-      snap.forEach((docSnap) => {
-        const data = docSnap.data();
-        list.push({
-          id: docSnap.id,
-          slNo: Number(data.slNo) || 1,
-          name: String(data.name || ""),
-          tabName: String(data.tabName || ""),
-          timeLimit: Number(data.timeLimit) || 15,
-          status: String(data.status || "draft"),
-          examDate: data.examDate ? String(data.examDate) : undefined,
-          markPerQuestion: data.markPerQuestion !== undefined ? Number(data.markPerQuestion) : 1,
-          penaltyMark: data.penaltyMark !== undefined ? Number(data.penaltyMark) : 0.25,
-          questionCount: data.questionCount !== undefined ? Number(data.questionCount) : undefined,
-          isFree: data.isFree !== undefined ? Boolean(data.isFree) : true,
-          price: data.price !== undefined ? Number(data.price) : 0,
-          showResult: data.showResult !== undefined ? Boolean(data.showResult) : false,
-          passPercentage: data.passPercentage !== undefined ? Number(data.passPercentage) : 40,
-          minPassMark: data.minPassMark !== undefined ? Number(data.minPassMark) : 0
-        });
-      });
-      list.sort((a, b) => a.slNo - b.slNo);
-      setExamList(list);
-    } catch (err: any) {
-      console.error("Error fetching exams:");
-      setError("পরীক্ষার তালিকা লোড করতে ব্যর্থ হয়েছে: " + err.message);
-    } finally {
-      setLoading(false);
-    }
-  };
-
+  // Reuse the exam list already loaded by App instead of reading examList again.
   useEffect(() => {
-    fetchExams();
+    const list = exams.map((exam) => ({
+      ...exam,
+      slNo: Number(exam.slNo) || 1,
+      timeLimit: Number(exam.timeLimit) || 15,
+      status: String(exam.status || "draft"),
+      markPerQuestion: exam.markPerQuestion !== undefined ? Number(exam.markPerQuestion) : 1,
+      penaltyMark: exam.penaltyMark !== undefined ? Number(exam.penaltyMark) : 0.25,
+      isFree: exam.isFree !== undefined ? Boolean(exam.isFree) : true,
+      price: exam.price !== undefined ? Number(exam.price) : 0,
+      showResult: exam.showResult !== undefined ? Boolean(exam.showResult) : false,
+      passPercentage: exam.passPercentage !== undefined ? Number(exam.passPercentage) : 40,
+      minPassMark: exam.minPassMark !== undefined ? Number(exam.minPassMark) : 0,
+    }));
+    list.sort((a, b) => a.slNo - b.slNo);
+    setExamList(list);
+    setLoading(false);
   }, [exams]);
 
   const resetForm = () => {
@@ -217,7 +196,6 @@ export default function AdminExamsSettings({ exams, onReload }: AdminExamsSettin
       trackEvent(`admin_exam_${mode}_success`, { examId: finalId });
 
       await onReload();
-      await fetchExams();
       setMode("list");
     } catch (err: any) {
       console.error(err);
@@ -236,7 +214,6 @@ export default function AdminExamsSettings({ exams, onReload }: AdminExamsSettin
       setSuccess(`"${exam.name}" পরীক্ষাটি সফলভাবে মুছে ফেলা হয়েছে।`);
       trackEvent("admin_exam_delete_success", { examId: exam.id });
       await onReload();
-      await fetchExams();
     } catch (err: any) {
       console.error(err);
       setError("মুছে ফেলতে ব্যর্থ হয়েছে: " + err.message);
